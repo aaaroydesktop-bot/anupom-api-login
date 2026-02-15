@@ -53,8 +53,8 @@ def decode_token(token: str):
         return None
 
 # ---------------- EMAIL OTP ----------------
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_USER = os.getenv("testanupom@gmail.com")
+EMAIL_PASS = os.getenv("vraykifwaowxliir")
 
 login_otp = {}
 reset_otp = {}

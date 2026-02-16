@@ -1,17 +1,18 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from passlib.context import CryptContext
-from jose import jwt
-from datetime import datetime, timedelta
-import random, smtplib, os
+from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
+import random
+import smtplib
 from email.mime.text import MIMEText
+from datetime import datetime, timedelta
+from jose import jwt
+import hashlib
+import os
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
+# CORS (Flutter connect এর জন্য)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,126 +21,140 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"message": "Anupom Login API Running 🚀"}
-
 # ---------------- DATABASE ----------------
-DATABASE_URL = "sqlite:///./users.db"
+conn = sqlite3.connect("users.db", check_same_thread=False)
+cursor = conn.cursor()
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users(
+    email TEXT PRIMARY KEY,
+    password TEXT
+)
+""")
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True)
-    password = Column(String)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS otp(
+    email TEXT,
+    code TEXT
+)
+""")
+conn.commit()
 
-Base.metadata.create_all(bind=engine)
-
-# ---------------- PASSWORD HASH ----------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str):
-    return pwd_context.hash(password)
-
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
-
-# ---------------- JWT ----------------
-SECRET_KEY = "ANUPOM_SECRET_KEY_12345"
+# ---------------- CONFIG ----------------
+SECRET_KEY = "ANUPOM_SECRET_KEY"
 ALGORITHM = "HS256"
 
-def create_token(email: str):
-    expire = datetime.utcnow() + timedelta(hours=5)
-    payload = {"sub": email, "exp": expire}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-# ---------------- EMAIL (ENV VARIABLE) ----------------
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 
-login_otp = {}
+# ---------------- UTILS ----------------
 
-def send_otp(email, otp):
+def hash_password(password: str):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str):
+    return hashlib.sha256(password.encode()).hexdigest() == hashed
+
+def create_token(email: str):
+    payload = {
+        "sub": email,
+        "exp": datetime.utcnow() + timedelta(days=7)
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def send_otp(email: str, code: str):
     try:
-        msg = MIMEText(f"Your OTP is: {otp}")
-        msg["Subject"] = "Login OTP"
+        msg = MIMEText(f"Your OTP Code is: {code}")
+        msg["Subject"] = "Your Login OTP"
         msg["From"] = EMAIL_USER
         msg["To"] = email
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, email, msg.as_string())
-
-        print("OTP SENT:", otp)
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, email, msg.as_string())
+        server.quit()
 
     except Exception as e:
         print("EMAIL ERROR:", e)
-        raise HTTPException(500, "Email server failed")
 
-# ---------------- SCHEMAS ----------------
-class RegisterSchema(BaseModel):
+# ---------------- MODELS ----------------
+
+class Register(BaseModel):
     email: EmailStr
     password: str
 
-class LoginSchema(BaseModel):
+class Login(BaseModel):
     email: EmailStr
     password: str
 
-class OTPSchema(BaseModel):
+class VerifyOTP(BaseModel):
     email: EmailStr
     otp: str
 
-# ---------------- DB ----------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ---------------- ROUTES ----------------
 
-# ---------------- REGISTER ----------------
+@app.get("/")
+def home():
+    return {"status": "API WORKING"}
+
+# REGISTER
 @app.post("/register")
-def register(data: RegisterSchema, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data.email).first()
-    if user:
-        raise HTTPException(400, "Email already exists")
+def register(data: Register):
 
-    new_user = User(
-        email=data.email,
-        password=hash_password(data.password)
+    cursor.execute("SELECT * FROM users WHERE email=?", (data.email,))
+    if cursor.fetchone():
+        raise HTTPException(400, "Email already registered")
+
+    hashed = hash_password(data.password)
+
+    cursor.execute(
+        "INSERT INTO users(email,password) VALUES(?,?)",
+        (data.email, hashed)
     )
-    db.add(new_user)
-    db.commit()
+    conn.commit()
 
-    return {"message": "Registered successfully"}
+    return {"message": "Registered Successfully"}
 
-# ---------------- LOGIN ----------------
+# LOGIN (OTP SEND)
 @app.post("/login")
-def login(data: LoginSchema, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data.email).first()
-    if not user or not verify_password(data.password, user.password):
-        raise HTTPException(401, "Invalid email or password")
+def login(data: Login):
 
-    otp = str(random.randint(100000, 999999))
-    login_otp[data.email] = otp
+    cursor.execute("SELECT password FROM users WHERE email=?", (data.email,))
+    user = cursor.fetchone()
 
-    send_otp(data.email, otp)
+    if not user:
+        raise HTTPException(400, "User not found")
+
+    if not verify_password(data.password, user[0]):
+        raise HTTPException(400, "Wrong password")
+
+    code = str(random.randint(100000, 999999))
+
+    cursor.execute("DELETE FROM otp WHERE email=?", (data.email,))
+    cursor.execute("INSERT INTO otp(email,code) VALUES(?,?)", (data.email, code))
+    conn.commit()
+
+    send_otp(data.email, code)
 
     return {"message": "OTP sent"}
 
-# ---------------- VERIFY OTP ----------------
+# VERIFY OTP
 @app.post("/verify-otp")
-def verify(data: OTPSchema):
-    stored = login_otp.get(data.email)
+def verify(data: VerifyOTP):
 
-    if not stored or stored != data.otp:
-        raise HTTPException(401, "Wrong OTP")
+    cursor.execute("SELECT code FROM otp WHERE email=?", (data.email,))
+    row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(400, "OTP expired")
+
+    if row[0] != data.otp:
+        raise HTTPException(400, "Invalid OTP")
 
     token = create_token(data.email)
-    del login_otp[data.email]
+
+    cursor.execute("DELETE FROM otp WHERE email=?", (data.email,))
+    conn.commit()
 
     return {"access_token": token}

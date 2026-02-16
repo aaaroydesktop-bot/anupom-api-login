@@ -4,15 +4,14 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
-from jose import jwt
+from jose import jwt, JWTError
 from datetime import datetime, timedelta
-import random, smtplib, os
-from email.mime.text import MIMEText
+import random
 
-# ================= APP =================
-app = FastAPI(title="Anupom Auth API")
+# ---------------- APP ----------------
+app = FastAPI()
 
-# ----------- CORS (Flutter এর জন্য জরুরি) -----------
+# -------- CORS (Flutter connect) --------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,18 +20,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root route
+# ---------------- ROOT ----------------
 @app.get("/")
 def root():
-    return {"status": "API Running 🚀"}
+    return {"message": "Anupom Login API Running 🚀"}
 
-# ================= DATABASE =================
+# ---------------- DATABASE ----------------
 DATABASE_URL = "sqlite:///./users.db"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
+# ---------------- USER TABLE ----------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -41,18 +41,17 @@ class User(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ================= PASSWORD HASH (FIXED) =================
-# bcrypt বাদ ❌ → pbkdf2 ব্যবহার ✔ (mobile safe)
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+# ---------------- PASSWORD HASH ----------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str):
-    return pwd_context.hash(password.strip())
+    return pwd_context.hash(password[:72])
 
 def verify_password(plain, hashed):
-    return pwd_context.verify(plain.strip(), hashed)
+    return pwd_context.verify(plain[:72], hashed)
 
-# ================= JWT =================
-SECRET_KEY = "ANUPOM_SUPER_SECRET_KEY_2026"
+# ---------------- JWT ----------------
+SECRET_KEY = "ANUPOM_SECRET_KEY_12345"
 ALGORITHM = "HS256"
 
 def create_token(email: str):
@@ -60,32 +59,24 @@ def create_token(email: str):
     payload = {"sub": email, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-# ================= EMAIL CONFIG =================
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
+def decode_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload["sub"]
+    except JWTError:
+        return None
 
-# OTP memory
+# ---------------- OTP STORAGE ----------------
 login_otp = {}
 
 def send_otp(email, otp):
-    try:
-        msg = MIMEText(f"Your login OTP is: {otp}")
-        msg["Subject"] = "Your Login OTP"
-        msg["From"] = EMAIL_USER
-        msg["To"] = email
+    # Email disabled (Render SMTP blocked)
+    print("\n==============================")
+    print("LOGIN OTP FOR:", email)
+    print("OTP:", otp)
+    print("==============================\n")
 
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.sendmail(EMAIL_USER, email, msg.as_string())
-        server.quit()
-
-        print("OTP SENT:", otp)
-
-    except Exception as e:
-        print("EMAIL ERROR:", e)
-        raise HTTPException(500, "Email sending failed")
-
-# ================= SCHEMAS =================
+# ---------------- SCHEMAS ----------------
 class RegisterSchema(BaseModel):
     email: EmailStr
     password: str
@@ -98,7 +89,7 @@ class OTPSchema(BaseModel):
     email: EmailStr
     otp: str
 
-# ================= DB DEP =================
+# ---------------- DB DEPENDENCY ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -106,7 +97,7 @@ def get_db():
     finally:
         db.close()
 
-# ================= REGISTER =================
+# ---------------- REGISTER ----------------
 @app.post("/register")
 def register(data: RegisterSchema, db: Session = Depends(get_db)):
 
@@ -123,11 +114,12 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
 
     return {"message": "Account created successfully"}
 
-# ================= LOGIN =================
+# ---------------- LOGIN ----------------
 @app.post("/login")
 def login(data: LoginSchema, db: Session = Depends(get_db)):
 
     user = db.query(User).filter(User.email == data.email).first()
+
     if not user or not verify_password(data.password, user.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -136,17 +128,32 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
 
     send_otp(data.email, otp)
 
-    return {"message": "OTP sent to email"}
+    return {"message": "OTP sent to server log"}
 
-# ================= VERIFY OTP =================
+# ---------------- VERIFY OTP ----------------
 @app.post("/verify-otp")
-def verify_otp(data: OTPSchema):
+def verify(data: OTPSchema):
 
     stored = login_otp.get(data.email)
-    if not stored or stored != data.otp:
+
+    if not stored:
+        raise HTTPException(status_code=400, detail="OTP expired")
+
+    if stored != data.otp:
         raise HTTPException(status_code=401, detail="Wrong OTP")
 
     token = create_token(data.email)
     del login_otp[data.email]
 
     return {"access_token": token}
+
+# ---------------- GET USER ----------------
+@app.get("/me")
+def get_me(token: str):
+
+    email = decode_token(token)
+
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return {"email": email}

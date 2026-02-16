@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -11,6 +12,20 @@ from email.mime.text import MIMEText
 # ---------------- APP ----------------
 app = FastAPI()
 
+# -------- CORS (Flutter connect এর জন্য খুব জরুরি) --------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- ROOT FIX ----------------
+@app.get("/")
+def home():
+    return {"status": "API Running Successfully 🚀"}
+
 # ---------------- DATABASE ----------------
 DATABASE_URL = "sqlite:///./users.db"
 
@@ -18,7 +33,6 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# ---------------- USER TABLE ----------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -27,7 +41,7 @@ class User(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ---------------- PASSWORD HASH ----------------
+# ---------------- PASSWORD ----------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str):
@@ -45,29 +59,29 @@ def create_token(email: str):
     payload = {"sub": email, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-def decode_token(token: str):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload["sub"]
-    except JWTError:
-        return None
-
-# ---------------- EMAIL OTP ----------------
+# ---------------- EMAIL (FIXED) ----------------
 EMAIL_USER = os.getenv("testanupom@gmail.com")
 EMAIL_PASS = os.getenv("vraykifwaowxliir")
 
 login_otp = {}
-reset_otp = {}
 
 def send_otp(email, otp):
-    msg = MIMEText(f"Your OTP is: {otp}")
-    msg["Subject"] = "Your Login OTP"
-    msg["From"] = EMAIL_USER
-    msg["To"] = email
+    try:
+        msg = MIMEText(f"Your Login OTP is: {otp}")
+        msg["Subject"] = "Login OTP"
+        msg["From"] = EMAIL_USER
+        msg["To"] = email
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
         server.login(EMAIL_USER, EMAIL_PASS)
         server.sendmail(EMAIL_USER, email, msg.as_string())
+        server.quit()
+
+        print("OTP SENT:", otp)
+
+    except Exception as e:
+        print("EMAIL ERROR:", e)
+        raise HTTPException(500, "Email sending failed")
 
 # ---------------- SCHEMAS ----------------
 class RegisterSchema(BaseModel):
@@ -82,11 +96,7 @@ class OTPSchema(BaseModel):
     email: EmailStr
     otp: str
 
-class ResetSchema(BaseModel):
-    email: EmailStr
-    new_password: str
-
-# ---------------- DB DEP ----------------
+# ---------------- DB ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -99,7 +109,7 @@ def get_db():
 def register(data: RegisterSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if user:
-        raise HTTPException(400, "Email already registered")
+        raise HTTPException(400, "Email already exists")
 
     new_user = User(
         email=data.email,
@@ -107,64 +117,32 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     )
     db.add(new_user)
     db.commit()
-    return {"message": "Registration successful"}
+
+    return {"message": "Registered successfully"}
 
 # ---------------- LOGIN ----------------
 @app.post("/login")
 def login(data: LoginSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if not user or not verify_password(data.password, user.password):
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(401, "Invalid email or password")
 
     otp = str(random.randint(100000, 999999))
     login_otp[data.email] = otp
+
     send_otp(data.email, otp)
 
-    return {"message": "OTP sent to email"}
+    return {"message": "OTP sent"}
 
 # ---------------- VERIFY OTP ----------------
 @app.post("/verify-otp")
 def verify(data: OTPSchema):
     stored = login_otp.get(data.email)
+
     if not stored or stored != data.otp:
-        raise HTTPException(401, "Invalid OTP")
+        raise HTTPException(401, "Wrong OTP")
 
     token = create_token(data.email)
     del login_otp[data.email]
 
     return {"access_token": token}
-
-# ---------------- FORGOT PASSWORD ----------------
-@app.post("/forgot-password")
-def forgot(data: LoginSchema, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data.email).first()
-    if not user:
-        raise HTTPException(404, "Email not found")
-
-    otp = str(random.randint(100000, 999999))
-    reset_otp[data.email] = otp
-    send_otp(data.email, otp)
-
-    return {"message": "Reset OTP sent"}
-
-# ---------------- RESET PASSWORD ----------------
-@app.post("/reset-password")
-def reset(data: OTPSchema, db: Session = Depends(get_db)):
-    stored = reset_otp.get(data.email)
-    if not stored or stored != data.otp:
-        raise HTTPException(401, "Invalid OTP")
-
-    user = db.query(User).filter(User.email == data.email).first()
-    user.password = hash_password("12345678")  # default temp
-    db.commit()
-    del reset_otp[data.email]
-
-    return {"message": "Password reset successful. Default password: 12345678"}
-
-# ---------------- GET USER ----------------
-@app.get("/me")
-def me(token: str):
-    email = decode_token(token)
-    if not email:
-        raise HTTPException(401, "Invalid token")
-    return {"email": email}
